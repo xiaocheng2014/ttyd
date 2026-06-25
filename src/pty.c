@@ -63,7 +63,13 @@ void pty_buf_free(pty_buf_t *buf) {
 }
 
 #ifndef _WIN32
+#define PTY_RECONNECT_MAX_ATTEMPTS 20
+#define PTY_RECONNECT_DELAY_MS 20
+#define PTY_STARTUP_RECONNECT_MAX_ATTEMPTS 40
+#define PTY_STARTUP_RECONNECT_DELAY_MS 50
+
 static void pty_reconnect_out(pty_process *process);
+static void startup_timer_cb(uv_timer_t *timer);
 #endif
 
 static void read_cb(uv_stream_t *stream, ssize_t n, const uv_buf_t *buf) {
@@ -71,7 +77,11 @@ static void read_cb(uv_stream_t *stream, ssize_t n, const uv_buf_t *buf) {
   pty_process *process = (pty_process *) stream->data;
   process->paused = true;
   if (n <= 0) {
-    if (n == UV_ENOBUFS || n == 0) return;
+    if (n == UV_ENOBUFS || n == 0 || n == UV_EAGAIN) {
+      free(buf->base);
+      pty_resume(process);
+      return;
+    }
 #ifndef _WIN32
     // The PTY master can briefly return EIO when the slave side is revoked
     // and reopened (e.g. login(1) calls vhangup() before re-attaching the
@@ -91,6 +101,10 @@ static void read_cb(uv_stream_t *stream, ssize_t n, const uv_buf_t *buf) {
     process->read_cb(process, NULL, true);
     goto done;
   }
+  process->output_seen = true;
+#ifndef _WIN32
+  if (process->startup_timer != NULL) uv_timer_stop(process->startup_timer);
+#endif
   process->reconnect_attempts = 0;
   process->read_cb(process, pty_buf_init(buf->base, (size_t) n), false);
 
@@ -139,6 +153,11 @@ void process_free(pty_process *process) {
     uv_close((uv_handle_t *) process->reconnect_timer, close_cb);
     process->reconnect_timer = NULL;
   }
+  if (process->startup_timer != NULL) {
+    uv_timer_stop(process->startup_timer);
+    uv_close((uv_handle_t *) process->startup_timer, close_cb);
+    process->startup_timer = NULL;
+  }
   if (process->in != NULL) uv_close((uv_handle_t *) process->in, close_cb);
   if (process->out != NULL) uv_close((uv_handle_t *) process->out, close_cb);
   if (process->argv != NULL) free(process->argv);
@@ -158,9 +177,20 @@ void pty_pause(pty_process *process) {
 void pty_resume(pty_process *process) {
   if (process == NULL) return;
   if (!process->paused) return;
-  process->paused = false;
   process->out->data = process;
-  uv_read_start((uv_stream_t *) process->out, alloc_cb, read_cb);
+  int err = uv_read_start((uv_stream_t *) process->out, alloc_cb, read_cb);
+  if (err) {
+    process->paused = true;
+#ifndef _WIN32
+    if (err == UV_EIO || err == UV_EBADF || err == UV_EINVAL) pty_reconnect_out(process);
+#endif
+    return;
+  }
+  process->paused = false;
+#ifndef _WIN32
+  if (!process->output_seen && process->startup_timer != NULL && process->startup_reconnect_attempts == 0)
+    uv_timer_start(process->startup_timer, startup_timer_cb, PTY_STARTUP_RECONNECT_DELAY_MS, 0);
+#endif
 }
 
 int pty_write(pty_process *process, pty_buf_t *buf) {
@@ -506,6 +536,8 @@ int pty_spawn(pty_process *process, pty_read_cb read_cb, pty_exit_cb exit_cb) {
   process->pid = pid;
   process->paused = true;
   process->reconnect_attempts = 0;
+  process->startup_reconnect_attempts = 0;
+  process->output_seen = false;
   process->read_cb = read_cb;
   process->exit_cb = exit_cb;
   process->async.data = process;
@@ -513,6 +545,9 @@ int pty_spawn(pty_process *process, pty_read_cb read_cb, pty_exit_cb exit_cb) {
   process->reconnect_timer = xmalloc(sizeof(uv_timer_t));
   uv_timer_init(process->loop, process->reconnect_timer);
   process->reconnect_timer->data = process;
+  process->startup_timer = xmalloc(sizeof(uv_timer_t));
+  uv_timer_init(process->loop, process->startup_timer);
+  process->startup_timer->data = process;
   uv_thread_create(&process->tid, wait_cb, process);
 
   return 0;
@@ -524,28 +559,17 @@ error:
   return status;
 }
 
-// Fixed-interval retry for re-arming process->out after a transient EIO on
-// the PTY master.  20 attempts at 20ms = 400ms total, which is plenty for
-// login(1) to reopen the slave side after vhangup().
-#define PTY_RECONNECT_MAX_ATTEMPTS 20
-#define PTY_RECONNECT_DELAY_MS 20
+static bool pty_replace_out(pty_process *process) {
+  if (process == NULL) return false;
 
-static void reconnect_timer_cb(uv_timer_t *timer) {
-  pty_process *process = (pty_process *) timer->data;
-  if (process == NULL) return;
-
-  // Tear down the poisoned pipe (the underlying dup'd fd is closed by libuv).
   if (process->out != NULL) {
     uv_read_stop((uv_stream_t *) process->out);
     uv_close((uv_handle_t *) process->out, close_cb);
     process->out = NULL;
   }
 
-  // The child may have exited while we were backing off; nothing to reconnect.
-  if (!process_running(process)) return;
+  if (!process_running(process)) return false;
 
-  // The kernel master fd (process->pty) is still valid - only libuv's wrapper
-  // got poisoned.  A fresh dup() + uv_pipe_open() gives us a working handle.
   process->out = xmalloc(sizeof(uv_pipe_t));
   uv_pipe_init(process->loop, process->out, 0);
 
@@ -553,11 +577,32 @@ static void reconnect_timer_cb(uv_timer_t *timer) {
     fprintf(stderr, "pty reconnect: fd_duplicate failed for pid %d\n", process->pid);
     uv_close((uv_handle_t *) process->out, close_cb);
     process->out = NULL;
-    return;
+    return false;
   }
 
   process->paused = true;
   pty_resume(process);
+  return true;
+}
+
+static void startup_timer_cb(uv_timer_t *timer) {
+  pty_process *process = (pty_process *) timer->data;
+  if (process == NULL || process->output_seen || !process_running(process)) return;
+
+  process->startup_reconnect_attempts++;
+  if (process->startup_reconnect_attempts > PTY_STARTUP_RECONNECT_MAX_ATTEMPTS) return;
+
+  if (!pty_replace_out(process)) return;
+
+  if (!process->output_seen && process->startup_reconnect_attempts < PTY_STARTUP_RECONNECT_MAX_ATTEMPTS)
+    uv_timer_start(process->startup_timer, startup_timer_cb, PTY_STARTUP_RECONNECT_DELAY_MS, 0);
+}
+
+static void reconnect_timer_cb(uv_timer_t *timer) {
+  pty_process *process = (pty_process *) timer->data;
+  if (process == NULL) return;
+
+  pty_replace_out(process);
 }
 
 static void pty_reconnect_out(pty_process *process) {
