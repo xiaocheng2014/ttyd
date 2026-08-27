@@ -48,26 +48,39 @@ static json_object *parse_window_size(const char *buf, size_t len, uint16_t *col
   return obj;
 }
 
+static bool format_origin_host(char *buf, size_t len, const char *address, int port) {
+  bool ipv6 = strchr(address, ':') != NULL;
+  bool bracketed = ipv6 && address[0] == '[';
+  int written;
+
+  if (port == 80 || port == 443) {
+    written = ipv6 && !bracketed ? snprintf(buf, len, "[%s]", address) : snprintf(buf, len, "%s", address);
+  } else {
+    written =
+        ipv6 && !bracketed ? snprintf(buf, len, "[%s]:%d", address, port) : snprintf(buf, len, "%s:%d", address, port);
+  }
+
+  return written > 0 && (size_t)written < len;
+}
+
 static bool check_host_origin(struct lws *wsi) {
-  char buf[256];
-  memset(buf, 0, sizeof(buf));
-  int len = lws_hdr_copy(wsi, buf, (int)sizeof(buf), WSI_TOKEN_ORIGIN);
+  char origin_buf[256];
+  memset(origin_buf, 0, sizeof(origin_buf));
+  int len = lws_hdr_copy(wsi, origin_buf, (int)sizeof(origin_buf), WSI_TOKEN_ORIGIN);
   if (len <= 0) return false;
 
   const char *prot, *address, *path;
   int port;
-  if (lws_parse_uri(buf, &prot, &address, &port, &path)) return false;
-  if (port == 80 || port == 443) {
-    snprintf(buf, sizeof(buf), "%s", address);
-  } else {
-    snprintf(buf, sizeof(buf), "%s:%d", address, port);
-  }
+  if (lws_parse_uri(origin_buf, &prot, &address, &port, &path)) return false;
+
+  char expected_host[256];
+  if (!format_origin_host(expected_host, sizeof(expected_host), address, port)) return false;
 
   char host_buf[256];
   memset(host_buf, 0, sizeof(host_buf));
   len = lws_hdr_copy(wsi, host_buf, (int)sizeof(host_buf), WSI_TOKEN_HOST);
 
-  return len > 0 && strcasecmp(buf, host_buf) == 0;
+  return len > 0 && strcasecmp(expected_host, host_buf) == 0;
 }
 
 static pty_ctx_t *pty_ctx_init(struct pss_tty *pss) {
